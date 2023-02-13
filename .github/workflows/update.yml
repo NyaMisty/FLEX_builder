@@ -1,0 +1,128 @@
+# General CI Template for various situation
+# **** Review All "XXX" Before Use ****
+# Author: Misty
+
+name: FlexAutoBuilder
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      debug_enabled:
+        description: 'Run the build with tmate debugging enabled (https://github.com/marketplace/actions/debugging-with-tmate)'
+        required: false
+        default: false
+  repository_dispatch:
+  schedule:
+    - cron: "0 */4 * * *" # min hour day week year
+
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      ##########################################################
+      ###
+      ### XXX: Pre-init steps here
+      ###
+      ##########################################################
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      ### XXX: Keep alive cron-type workflows
+      - uses: gautamkrishnar/keepalive-workflow@master
+
+      - name: Generate timestamp
+        id: timestamp # output: value
+        run: |
+          TIMESTAMP="$(date +"%Y%m%d")"
+          echo "Timestamp: ${TIMESTAMP}"
+          echo "::set-output name=value::${TIMESTAMP}"
+        
+      # Enable tmate debugging of manually-triggered workflows if the input option was provided
+      - name: Setup tmate session
+        uses: mxschmitt/action-tmate@v3
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.debug_enabled }}
+        env:
+          SECRETS_CONTEXT: ${{ toJson(secrets) }}
+      
+
+      - name: Update submodules
+        run: |
+          git submodule update --init --recursive
+          git submodule update --remote
+    
+      - name: Check submodule update
+        id: update
+        run: |
+          FLEXSHA=$(cd FLEX && git rev-parse HEAD)
+          if ! git diff --exit-code FLEX; then
+            echo "FLEX Updated!"
+            echo "updated=1" >> $GITHUB_OUTPUT
+          elif ! git rev-parse build-$FLEXSHA; then
+            echo "FLEX NOT Updated, But NightlyBuild Not exist"
+            echo "updated=1" >> $GITHUB_OUTPUT
+          else
+            echo "Everything OK"
+            echo "updated=0" >> $GITHUB_OUTPUT
+          fi
+          echo "commit=$FLEXSHA" >> $GITHUB_OUTPUT
+
+      - name: Install ldid
+        if: ${{ steps.update.outputs.updated == '1' }}
+        run: brew install ldid
+
+      - name: Do xcodebuild
+        if: ${{ steps.update.outputs.updated == '1' }}
+        run: |
+          xcodebuild -project FLEX/FLEX.xcodeproj -target FLEX
+      - name: Zip Output
+        if: ${{ steps.update.outputs.updated == '1' }}
+        run: |
+          set -e
+          mkdir -p output
+          OUTDIR="$(pwd)/output"
+          cp FLEX/build/Release-iphoneos/FLEX.framework/FLEX output/libflex.dylib
+          ldid -S output/libflex.dylib
+          (cd FLEX/build/Release-iphoneos; zip -qr $OUTDIR/FLEX_framework.zip *)
+
+      - name: Commit Changes & Push
+        id: commit
+        if: ${{ steps.update.outputs.updated == '1' }}
+        run: |
+          git commit FLEX --allow-empty -m "Updated FLEX ${{ steps.timestamp.outputs.value }} commit ${{ steps.update.outputs.commit }}"
+          echo "buildercommit=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          git push
+
+      ##########################################################
+      ###
+      ### XXX: Artifact Upload
+      ###
+      ##########################################################
+      
+      # XXX: Select one debug artifact uploading
+      # Upload action artifact as-is
+      - name: Upload to GitHub Actions artifact
+        if: ${{ steps.update.outputs.updated == '1' }}
+        uses: NyaMisty/upload-artifact-as-is@master
+        with:
+          path: output/*
+      
+      - name: Create New Release and Upload
+        if: ${{ steps.update.outputs.updated == '1' }}
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: "output/*"
+          name: "${{ format('FlexNightlyBuild: {0} commit {1}', steps.timestamp.outputs.value, steps.update.outputs.commit) }}"
+          tag: "${{ format('build-{0}', steps.update.outputs.commit) }}"
+          commit: ${{ steps.commit.outputs.buildercommit }}
+          #prerelease: true
+          allowUpdates: true
+
+          # XXX: edit this to false & true if you want to preserve original artifact
+          removeArtifacts: true
+          replacesArtifacts: false
+          artifactErrorsFailBuild: true
+          token: ${{ secrets.GITHUB_TOKEN }}
